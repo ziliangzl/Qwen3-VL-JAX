@@ -12,9 +12,22 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 import flax, flax.linen as nn, jax, jax.numpy as jnp
 import numpy as np
 from flax import struct
+from flax.linen.linear import default_kernel_init
+from jax.sharding import NamedSharding, PartitionSpec
 from safetensors import safe_open
 
 DType = jnp.dtype
+
+
+def _activation_shard(
+    x: jax.Array,
+    mesh: Optional[jax.sharding.Mesh],
+    spec: PartitionSpec,
+) -> jax.Array:
+    """Optional activation layout hints for Megatron-style tensor parallelism."""
+    if mesh is None:
+        return x
+    return jax.lax.with_sharding_constraint(x, NamedSharding(mesh, spec))
 
 # ============================================================================
 # Data structures
@@ -357,12 +370,68 @@ class FeedForward(nn.Module):
     intermediate_size: int
     dtype: DType = jnp.bfloat16
     use_bias: bool = False
+    #: Mesh axis name for Megatron-style column/row parallel linears (e.g. ``"tp"``).
+    tp_axis: Optional[str] = None
+
+    def _dense_col(self, features: int, name: str) -> nn.Dense:
+        """Column-parallel: shard output features (kernel ``(None, tp)``)."""
+        if self.tp_axis is None:
+            return nn.Dense(
+                features, use_bias=self.use_bias, dtype=self.dtype, name=name
+            )
+        t = self.tp_axis
+        ki = nn.with_partitioning(default_kernel_init, (None, t))
+        if self.use_bias:
+            bi = nn.with_partitioning(nn.initializers.zeros_init(), (t,))
+            return nn.Dense(
+                features,
+                use_bias=True,
+                dtype=self.dtype,
+                name=name,
+                kernel_init=ki,
+                bias_init=bi,
+            )
+        return nn.Dense(
+            features, use_bias=False, dtype=self.dtype, name=name, kernel_init=ki
+        )
+
+    def _dense_row(self, features: int, name: str) -> nn.Dense:
+        """Row-parallel: shard input features (kernel ``(tp, None)``); bias replicated."""
+        if self.tp_axis is None:
+            return nn.Dense(
+                features, use_bias=self.use_bias, dtype=self.dtype, name=name
+            )
+        t = self.tp_axis
+        ki = nn.with_partitioning(default_kernel_init, (t, None))
+        if self.use_bias:
+            return nn.Dense(
+                features,
+                use_bias=True,
+                dtype=self.dtype,
+                name=name,
+                kernel_init=ki,
+            )
+        return nn.Dense(
+            features, use_bias=False, dtype=self.dtype, name=name, kernel_init=ki
+        )
 
     @nn.compact
-    def __call__(self, x: jax.Array) -> jax.Array:
-        gate = nn.Dense(self.intermediate_size, use_bias=self.use_bias, dtype=self.dtype, name="gate_proj")(x)
-        up = nn.Dense(self.intermediate_size, use_bias=self.use_bias, dtype=self.dtype, name="up_proj")(x)
-        down = nn.Dense(self.hidden_size, use_bias=self.use_bias, dtype=self.dtype, name="down_proj")(nn.silu(gate) * up)
+    def __call__(
+        self, x: jax.Array, mesh: Optional[jax.sharding.Mesh] = None
+    ) -> jax.Array:
+        tp = self.tp_axis
+        if mesh is not None and tp is not None:
+            x = _activation_shard(x, mesh, PartitionSpec(None, None, None))
+        gate = self._dense_col(self.intermediate_size, "gate_proj")(x)
+        up = self._dense_col(self.intermediate_size, "up_proj")(x)
+        hidden = nn.silu(gate) * up
+        if mesh is not None and tp is not None:
+            hidden = _activation_shard(
+                hidden, mesh, PartitionSpec(None, None, tp)
+            )
+        down = self._dense_row(self.hidden_size, "down_proj")(hidden)
+        if mesh is not None and tp is not None:
+            down = _activation_shard(down, mesh, PartitionSpec(None, None, None))
         return down
 
 
@@ -374,24 +443,69 @@ class MultiHeadAttention(nn.Module):
     rope_section: Sequence[int]
     eps: float = 1e-6
     dtype: DType = jnp.bfloat16
+    tp_axis: Optional[str] = None
+
+    def _dense_col(self, features: int, name: str) -> nn.Dense:
+        """Column-parallel linear (shard ``out_features``)."""
+        if self.tp_axis is None:
+            return nn.Dense(
+                features, use_bias=True, dtype=self.dtype, name=name
+            )
+        t = self.tp_axis
+        ki = nn.with_partitioning(default_kernel_init, (None, t))
+        bi = nn.with_partitioning(nn.initializers.zeros_init(), (t,))
+        return nn.Dense(
+            features,
+            use_bias=True,
+            dtype=self.dtype,
+            name=name,
+            kernel_init=ki,
+            bias_init=bi,
+        )
+
+    def _dense_row(self, features: int, name: str) -> nn.Dense:
+        """Row-parallel linear (shard ``in_features``); no bias on ``o_proj``."""
+        if self.tp_axis is None:
+            return nn.Dense(
+                features, use_bias=False, dtype=self.dtype, name=name
+            )
+        t = self.tp_axis
+        ki = nn.with_partitioning(default_kernel_init, (t, None))
+        return nn.Dense(
+            features, use_bias=False, dtype=self.dtype, name=name, kernel_init=ki
+        )
 
     @nn.compact
-    def __call__(self, x: jax.Array, cos: jax.Array, sin: jax.Array,
-                mask: Optional[jax.Array] = None) -> jax.Array:
+    def __call__(
+        self,
+        x: jax.Array,
+        cos: jax.Array,
+        sin: jax.Array,
+        mask: Optional[jax.Array] = None,
+        mesh: Optional[jax.sharding.Mesh] = None,
+    ) -> jax.Array:
         """Causal self‑attention with optional grouped‑query.
 
         Args:
             x: [B, T, C]
             cos/sin: RoPE tables (text or mRoPE)
             mask: [B, T] 1 for valid tokens
+            mesh: When ``tp_axis`` is set, optional mesh for activation constraints.
 
         Returns:
             out: [B, T, C]
         """
-        # Project to q, k, v
-        q = nn.Dense(self.num_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="q_proj")(x)
-        k = nn.Dense(self.num_kv_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="k_proj")(x)
-        v = nn.Dense(self.num_kv_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="v_proj")(x)
+        tp = self.tp_axis
+        if mesh is not None and tp is not None:
+            x = _activation_shard(x, mesh, PartitionSpec(None, None, None))
+        # Project to q, k, v (column-parallel when tp_axis is set)
+        q = self._dense_col(self.num_heads * self.head_dim, "q_proj")(x)
+        k = self._dense_col(self.num_kv_heads * self.head_dim, "k_proj")(x)
+        v = self._dense_col(self.num_kv_heads * self.head_dim, "v_proj")(x)
+        if mesh is not None and tp is not None:
+            q = _activation_shard(q, mesh, PartitionSpec(None, None, tp))
+            k = _activation_shard(k, mesh, PartitionSpec(None, None, tp))
+            v = _activation_shard(v, mesh, PartitionSpec(None, None, tp))
 
         batch, seqlen = q.shape[0], q.shape[1]
         q = q.reshape(batch, seqlen, self.num_heads, self.head_dim)
@@ -446,7 +560,10 @@ class MultiHeadAttention(nn.Module):
             out = jnp.einsum("bhqk,bhkd->bhqd", weights, v.astype(jnp.float32)).astype(self.dtype)
 
         out = jnp.transpose(out, (0, 2, 1, 3)).reshape(batch, seqlen, -1)
-        return nn.Dense(self.hidden_size, use_bias=False, dtype=self.dtype, name="o_proj")(out)
+        out = self._dense_row(self.hidden_size, "o_proj")(out)
+        if mesh is not None and tp is not None:
+            out = _activation_shard(out, mesh, PartitionSpec(None, None, None))
+        return out
 
 
 class DecoderBlock(nn.Module):
@@ -458,19 +575,39 @@ class DecoderBlock(nn.Module):
     rope_section: Sequence[int]
     eps: float
     dtype: DType = jnp.bfloat16
+    tp_axis: Optional[str] = None
 
     def setup(self):
         self.input_norm = RMSNorm(self.hidden_size, self.eps, self.dtype)
         self.post_norm = RMSNorm(self.hidden_size, self.eps, self.dtype)
-        self.attn = MultiHeadAttention(self.hidden_size, self.num_heads, self.num_kv_heads,
-                                       self.head_dim, self.rope_section, self.eps, self.dtype)
-        self.mlp = FeedForward(self.hidden_size, self.intermediate_size, self.dtype)
+        self.attn = MultiHeadAttention(
+            self.hidden_size,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rope_section,
+            self.eps,
+            self.dtype,
+            tp_axis=self.tp_axis,
+        )
+        self.mlp = FeedForward(
+            self.hidden_size,
+            self.intermediate_size,
+            self.dtype,
+            tp_axis=self.tp_axis,
+        )
 
-    def __call__(self, x: jax.Array, cos: jax.Array, sin: jax.Array,
-                mask: Optional[jax.Array] = None) -> jax.Array:
-        attn_out = self.attn(self.input_norm(x), cos, sin, mask)
+    def __call__(
+        self,
+        x: jax.Array,
+        cos: jax.Array,
+        sin: jax.Array,
+        mask: Optional[jax.Array] = None,
+        mesh: Optional[jax.sharding.Mesh] = None,
+    ) -> jax.Array:
+        attn_out = self.attn(self.input_norm(x), cos, sin, mask, mesh=mesh)
         x = x + attn_out
-        x = x + self.mlp(self.post_norm(x))
+        x = x + self.mlp(self.post_norm(x), mesh=mesh)
         return x
 
 
